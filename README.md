@@ -1,132 +1,166 @@
 # qwen3-tts-server
 
-OpenAI-compatible `/v1/audio/speech` HTTP server backed by
-[**Qwen3-TTS-12Hz-1.7B-VoiceDesign**](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign),
-optimized for **NVIDIA DGX Spark** (GB10, sm_121a / sm_120 wheels) and
-other Blackwell consumer GPUs.
+OpenAI-compatible voice-AI sidecars for **NVIDIA DGX Spark** (GB10, sm_121a /
+sm_120 wheels) and other Blackwell consumer GPUs. One docker image, two
+endpoints:
 
-A thin FastAPI wrapper (`server.py`) around the `qwen-tts` Python SDK that:
+- **TTS** — `/v1/audio/speech` backed by [Qwen3-TTS-12Hz-1.7B-VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign)
+  via a thin FastAPI wrapper around the `qwen-tts` SDK. CUDA + bf16 +
+  flash-attn 2 (sm_120 wheel built into the image).
+- **ASR** — `/v1/audio/transcriptions` backed by [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B)
+  served natively by vLLM (`Qwen3ASRForConditionalGeneration`).
 
-- Loads the model on **CUDA** in **bf16** with **flash-attn 2** (auto-falls back to SDPA / eager).
-- Exposes the OpenAI `/v1/audio/speech` body (`input`, `voice`, `response_format`) plus an
-  optional `language` hint, so existing OpenAI SDK clients work unchanged.
-- Maps OpenAI `voice` → qwen-tts `instruct` (free-form natural-language voice description —
-  e.g. *"A warm, gravelly male voice with a slight Scottish accent, slow pacing."*).
-- Returns `wav` / `flac` / `mp3` (mp3 needs system `libmp3lame`).
+Both endpoints follow OpenAI request shapes so existing OpenAI SDK clients
+work unchanged.
 
-Designed to drop into a multi-container voice pipeline behind a vLLM main model
-on the same Docker bridge — keep the LLM → TTS hop on loopback, push only the
-audio bytes to the client.
+## Performance — DGX Spark, hot path
 
-## Performance — DGX Spark (GB10, sm_121a)
+| stage  | wall    | RTF    | notes                                      |
+| ------ | ------- | ------ | ------------------------------------------ |
+| TTS    | 1476 ms | 1.30×  | 31 chars → 1.92 s mono 24 kHz WAV          |
+| ASR    | 120 ms  | 16.04× | 1.92 s WAV → text                          |
+| **Total round-trip** | **1.6 s** | — | text → speech → text, exact match |
 
-End-to-end probe: vLLM main (Qwen3.6-27B NVFP4 + DFlash) → `/v1/chat/completions`
-→ this TTS server → 16-bit / 24 kHz WAV. Both containers on the same Docker
-bridge.
+Plus the LLM main of your choice via the same Docker bridge (see
+[Recommended full-stack pairing](#recommended-full-stack-pairing) below).
 
-| stage         | cold       | hot         |
-| ------------- | ---------- | ----------- |
-| LLM (8 toks)  | 1460 ms    | 482 ms      |
-| TTS synth     | 5140 ms    | **2137 ms** |
-| TTS RTF       | 0.39x      | **1.16x**   |
-| TOTAL wall    | 6600 ms    | **2619 ms** |
+## QuickStart
 
-(31 input chars → ~2.5 s playback; "REAL-TIME" = TTS faster than playback rate.)
+The image is published at **`ghcr.io/aeon-7/qwen3-tts-server:latest`**.
 
-For reference, the same server on **CPU / fp32** synthesized the same clip in
-**~47 s** (RTF 0.05x). The CUDA + bf16 + flash-attn 2 path is ~23× faster.
-
-## Quickstart
-
-### Docker Compose (recommended)
+### One-shot full sidecar stack
 
 ```bash
-# one-time: create the shared bridge if it doesn't exist
-docker network create aeon-stack
+# clone for the deploy scripts (image itself comes from ghcr)
+git clone https://github.com/AEON-7/qwen3-tts-server
+cd qwen3-tts-server
 
-# build (first time compiles flash-attn for sm_120 — slow, ~10–15 min on Spark)
-# subsequent restarts use the cached image
-docker compose up -d --build
-
-# verify
-curl http://localhost:8002/health
-# {"status":"ok","model_loaded":true}
+bash deploy/deploy-stack.sh           # interactive: pick model variants
+# or:
+bash deploy/deploy-stack.sh --yes     # use validated defaults, non-interactive
 ```
 
-### Synthesize speech
+This brings up:
 
-OpenAI-compatible — drop in the OpenAI SDK with `base_url=http://localhost:8002/v1`:
+- `qwen3-tts` on `:8002` — TTS sidecar
+- `qwen3-asr` on `:8001` — ASR sidecar
+- shared `aeon-stack` Docker bridge for sub-ms LLM↔ASR↔TTS hops
+
+Then add your vLLM main on `:8000` joined to `aeon-stack` — see
+[ARCHITECTURE.md](docs/ARCHITECTURE.md) for the recommended pairing.
+
+### Just one sidecar
 
 ```bash
+bash deploy/deploy-tts.sh             # interactive TTS only
+bash deploy/deploy-asr.sh             # interactive ASR only
+```
+
+Both scripts let you pick from the [supported model variants](docs/MODELS.md);
+defaults are the validated `1.7B-VoiceDesign` for TTS and `0.6B` for ASR.
+
+### Smoke tests
+
+```bash
+# TTS — text in, WAV bytes out
 curl -X POST http://localhost:8002/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{
-    "input": "The quick brown fox jumps over the lazy dog.",
-    "voice": "A bright, expressive female voice with clear pronunciation and natural pacing.",
-    "response_format": "wav"
-  }' \
+  -d '{"input":"Hello world","response_format":"wav"}' \
   --output speech.wav
+
+# ASR — WAV in, text out
+curl -X POST http://localhost:8001/v1/audio/transcriptions \
+  -F file=@speech.wav -F model=qwen3-asr -F language=en
 ```
 
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8002/v1", api_key="ignored")
-resp = client.audio.speech.create(
-    model="qwen3-tts",
-    input="The quick brown fox jumps over the lazy dog.",
-    voice="A bright, expressive female voice with clear pronunciation.",
-    response_format="wav",
-)
-resp.stream_to_file("speech.wav")
-```
+If both return 200 you have a working voice loop.
 
-## Voice design
+## Environment variables
 
-`voice` is forwarded to qwen-tts as the `instruct` field — a free-form natural-language
-description of the voice you want. The model conditions on this each call (no
-voice cloning / reference audio). Examples:
+All configuration is via env. Below is the exhaustive list — every variable
+is optional and has a sensible default.
 
-- `"A neutral, friendly adult voice with clear pronunciation, moderate pace, and natural intonation."` (default)
-- `"An elderly British man, gravelly and warm, slow and deliberate."`
-- `"A cheerful young woman with a slight French accent, energetic pacing."`
-- `"A robotic monotone, even cadence, no emotional inflection."`
+### TTS sidecar
 
-## Configuration
+| var                        | default                                       | meaning                                                                       |
+| -------------------------- | --------------------------------------------- | ----------------------------------------------------------------------------- |
+| `QWEN_TTS_MODEL`           | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`        | HF repo id of the TTS model. See [MODELS.md](docs/MODELS.md).                 |
+| `QWEN_TTS_TOKENIZER`       | `Qwen/Qwen3-TTS-Tokenizer-12Hz`               | HF repo id of the codec tokenizer (shared by every TTS variant).              |
+| `QWEN_TTS_DEFAULT_VOICE`   | `"A neutral, friendly adult voice ..."`       | `instruct` description used when a request omits `voice`.                     |
+| `QWEN_TTS_ATTN_IMPL`       | auto: `flash_attention_2` else `sdpa`         | force one of `flash_attention_2` / `sdpa` / `eager`.                          |
 
-All env vars are optional.
+### ASR sidecar (passed to vLLM via deploy-asr.sh)
 
-| var                       | default                                              | notes                                                       |
-| ------------------------- | ---------------------------------------------------- | ----------------------------------------------------------- |
-| `QWEN_TTS_MODEL`          | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`               | HF repo id                                                  |
-| `QWEN_TTS_TOKENIZER`      | `Qwen/Qwen3-TTS-Tokenizer-12Hz`                      | HF repo id                                                  |
-| `QWEN_TTS_DEFAULT_VOICE`  | neutral adult description (see `server.py`)          | used when request omits `voice`                             |
-| `QWEN_TTS_ATTN_IMPL`      | auto: `flash_attention_2` if available, else `sdpa`  | force one of `flash_attention_2` / `sdpa` / `eager`         |
+| var          | default                | meaning                                                              |
+| ------------ | ---------------------- | -------------------------------------------------------------------- |
+| `QWEN_ASR_MODEL` | `Qwen/Qwen3-ASR-0.6B`  | HF repo id of the ASR model.                                         |
+| `GPU_MEM`    | `0.08`                 | vLLM `--gpu-memory-utilization`. Bump to `0.10+` for larger ASR.     |
+| `MAX_LEN`    | `8192`                 | vLLM `--max-model-len`. ASR inputs rarely exceed 4 K tokens.         |
+| `MAX_SEQS`   | `4`                    | vLLM `--max-num-seqs` (concurrent transcription jobs).               |
 
-The supported `language` values (auto-detected if omitted): `auto`, `chinese`,
-`english`, `french`, `german`, `italian`, `japanese`, `korean`, `portuguese`,
-`russian`, `spanish`. The OpenAI body field is short codes (`zh`, `en`, `ja`, ...)
-which the server maps via the underlying SDK.
+### Shared / deployment
 
-## Image
+| var          | default                                              | meaning                                                                  |
+| ------------ | ---------------------------------------------------- | ------------------------------------------------------------------------ |
+| `IMAGE`      | `ghcr.io/aeon-7/qwen3-tts-server:latest`             | Docker image to run.                                                     |
+| `PORT`       | `8002` (TTS) / `8001` (ASR)                          | Host port to bind.                                                       |
+| `NETWORK`    | `aeon-stack`                                         | Docker bridge name (auto-created if missing). Join your vLLM main here too. |
+| `HF_CACHE`   | `${HOME}/.cache/huggingface`                         | Host path for the HF model cache, bind-mounted into the container.       |
+| `HF_TOKEN`   | (unset)                                              | Forwarded to the container if set. Needed only for gated repos.          |
+| `CONTAINER`  | `qwen3-tts` / `qwen3-asr`                            | Container name.                                                          |
 
-The Dockerfile starts from a vLLM image that already has the right
-torch + audio stack for aarch64 / sm_121a:
+### Client-side (matrix-voip-agent / OpenClaw)
 
-```
-FROM ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v3
-```
+When integrating from another host, point your client at the Spark IP. These
+are NOT consumed by this server — they're the conventional names downstream
+clients should use:
 
-If you're not on Spark, swap the base image for any CUDA + torch image with
-`librosa` / `soundfile` available, then rebuild. The flash-attn install line
-auto-falls back to SDPA at runtime if the wheel build fails.
+| var               | example                                           | meaning                                       |
+| ----------------- | ------------------------------------------------- | --------------------------------------------- |
+| `LLM_BASE_URL`    | `http://192.168.1.116:8000/v1`                    | vLLM main OpenAI base URL.                    |
+| `LLM_MODEL`       | `qwen36-ultimate-xs`                              | served-model-name on the vLLM main.           |
+| `TTS_ENDPOINT`    | `http://192.168.1.116:8002/v1/audio/speech`       | this server's TTS endpoint.                   |
+| `TTS_MODEL`       | `qwen3-tts`                                       | OpenAI `model` field (single served model).   |
+| `TTS_VOICE`       | (free-form description)                           | maps to qwen-tts `instruct`.                  |
+| `ASR_ENDPOINT`    | `http://192.168.1.116:8001/v1/audio/transcriptions` | this server's ASR endpoint.                 |
+| `ASR_MODEL`       | `qwen3-asr`                                       | OpenAI `model` field.                         |
+| `ASR_LANGUAGE`    | `en` (or `auto`, `zh`, `ja`, ...)                 | ASR language hint.                            |
+
+## Recommended full-stack pairing
+
+This sidecar pair is designed to slot in next to a fast vLLM main on the same
+Docker bridge. Recommended:
+
+> **Qwen3.6-27B AEON Ultimate Uncensored MTP-XS** (NVFP4 + DFlash speculative
+> decoding) served by the AEON-7 v3 vLLM image:
+> [`ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v3`](https://github.com/AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-DFlash)
+
+That pairing fits comfortably alongside this image on a single Spark with
+~95 GB unified RAM headroom and lands a **2.6 s end-to-end voice turn**
+(text question → spoken answer ready). Full rationale + bring-up in
+[ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Documentation index
+
+- [docs/MODELS.md](docs/MODELS.md) — every supported Qwen3-TTS / Qwen3-ASR
+  variant, params, when to pick each one.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — recommended deployment
+  topology including vLLM main, Matrix server, OpenClaw gateway, and the
+  matrix-voip-agent integration.
+- [agents.md](agents.md) — agent-readable bring-up runbook for autonomous
+  deployments.
+- [Dockerfile](Dockerfile) — image definition, including the flash-attn 2
+  sm_120 build and the `av` (PyAV) install for vLLM's audio decode fallback.
+- [server.py](server.py) — the TTS FastAPI wrapper (~165 lines).
 
 ## Endpoints
 
-- `GET  /health` — liveness + load status
-- `GET  /v1/models` — single served model `qwen3-tts`
-- `POST /v1/audio/speech` — OpenAI body, returns audio bytes
+- `GET  /health` — liveness + load status (TTS sidecar)
+- `GET  /v1/models` — single served model
+- `POST /v1/audio/speech` — OpenAI body, returns audio bytes (TTS)
+- `POST /v1/audio/transcriptions` — OpenAI multipart/form-data, returns text (ASR; vLLM-native)
 
 ## License
 
-Apache-2.0. Underlying model weights are released under the
-[Qwen license](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign).
+Apache-2.0. Underlying model weights are released under their respective
+[Qwen licenses](https://huggingface.co/Qwen).

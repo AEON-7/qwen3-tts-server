@@ -19,11 +19,23 @@ RUN pip install --no-cache-dir --break-system-packages \
 # Cap MAX_JOBS to keep memory pressure down on Spark's unified RAM during the
 # native build; 4 is conservative for a 20-core ARM with 128GB but keeps the
 # build stable.
+# NOTE: Kept above the vllm[audio] line so this expensive layer stays cached
+# across small dep tweaks below.
 ENV MAX_JOBS=4 \
     FLASH_ATTN_CUDA_ARCHS=120
 RUN pip install --no-cache-dir --break-system-packages --no-build-isolation \
       "flash-attn>=2.7" \
  || (echo "flash-attn install failed; will fall back to sdpa at runtime" && true)
+
+# vLLM's audio decode path needs `av` (PyAV) as the container-format fallback
+# (M4A / WebM / MP4 / odd WAVs that soundfile can't sniff from a BytesIO).
+# `soundfile` itself is already pulled in transitively by qwen-tts above.
+#
+# We install `av` ALONE with --no-deps because the full `vllm[audio]` extra
+# re-resolves vLLM's core deps and downgrades flashinfer + apache-tvm-ffi,
+# which silently regresses TTS inference latency by ~5x. PyAV is the only
+# missing piece — soundfile is already there.
+RUN pip install --no-cache-dir --break-system-packages --no-deps "av>=12"
 
 WORKDIR /app
 COPY server.py /app/server.py
