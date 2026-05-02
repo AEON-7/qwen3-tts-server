@@ -1,0 +1,39 @@
+# OpenAI-compatible TTS sidecar — Qwen3-TTS-12Hz-1.7B-VoiceDesign on GPU
+# bf16 + flash-attn 2 (sm_120 / Spark) → ~1.16x RTF (real-time) on DGX Spark.
+#
+# Designed to share a Docker bridge with a vLLM container so the LLM→TTS hop
+# stays on the local bridge (sub-ms loopback). To use:
+#   docker network create aeon-stack    # one-time, if not already created
+#   docker compose up -d --build
+services:
+  qwen3-tts:
+    build: .
+    image: qwen3-tts-server:latest
+    container_name: qwen3-tts
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      # Optional overrides:
+      # - QWEN_TTS_MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+      # - QWEN_TTS_TOKENIZER=Qwen/Qwen3-TTS-Tokenizer-12Hz
+      # - QWEN_TTS_ATTN_IMPL=flash_attention_2   # or sdpa / eager
+      # - QWEN_TTS_DEFAULT_VOICE=A neutral, friendly adult voice ...
+    volumes:
+      # Reuse host HF cache so the 1.7B model doesn't re-download on every rebuild
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    networks:
+      - aeon-stack
+    ports:
+      - "8002:8002"
+    shm_size: "4gb"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8002/health',timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+networks:
+  aeon-stack:
+    external: true
