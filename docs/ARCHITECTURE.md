@@ -1,9 +1,10 @@
-# Recommended Deployment Architecture
+# Recommended Full-Stack Architecture
 
 This page describes the deployment topology this image is designed for: a
-single low-latency voice-AI host that serves an LLM main, ASR, and TTS as
-three OpenAI-compatible endpoints on a shared Docker bridge, with downstream
-clients (Matrix server, OpenClaw, agents) speaking to it over the LAN.
+single low-latency voice-AI host that serves an LLM main + ASR + TTS as
+three OpenAI-compatible endpoints on a shared Docker bridge, with
+downstream clients (Matrix server, agents, custom apps) speaking to it
+over the LAN.
 
 ## Topology
 
@@ -23,38 +24,45 @@ clients (Matrix server, OpenClaw, agents) speaking to it over the LAN.
                       └───────────────────────────────────┼─────────────────────────────────────────┘
                                                           │ host network (LAN, ~1 ms)
                                                           ▼
-                      ┌──────────────────────── pacific (192.168.1.155) ────────────────────────────┐
+                      ┌─────────────────────── matrix-voip-agent host ──────────────────────────────┐
                       │                                                                             │
-                      │   matrix-voip-agent       OpenClaw gateway       Matrix homeserver          │
-                      │   (Node/TS, headless)     (skills + memory)      (Synapse / Conduit)        │
-                      │                                                                             │
+                      │   matrix-voip-agent (Node/TS, headless WebRTC bridge)                       │
+                      │              │                                                              │
+                      │              ▼                                                              │
+                      │   Matrix homeserver (Synapse / Conduit / etc.)                              │
+                      │              │                                                              │
+                      │              ▼                                                              │
+                      │   Element / nheko / any Matrix client = "dial the AI"                       │
                       └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Why this layout
 
 - **All three AI services on one Docker bridge.** Inter-container hops are
-  loopback-fast (sub-ms). The LLM → TTS pipeline never leaves the host.
-- **OpenClaw + Matrix on a separate host.** Voice agents only need a thin
-  audio-bytes pipe from the Matrix WebRTC plane to the Spark sidecars, which
-  is one LAN hop (~1-2 ms — negligible compared to the typical 30-200 ms an
-  internet hop would add).
+  loopback-fast (sub-ms). The LLM → ASR → TTS pipeline never leaves the host.
+- **Orchestration on a separate host.** Voice agents only need a thin audio
+  pipe from the WebRTC plane to the Spark sidecars — one LAN hop (~1-2 ms,
+  negligible vs the 30-200 ms an internet hop would add).
 - **No co-location of orchestration with inference.** Keeps the Spark
-  dedicated to GPU work; OpenClaw / Matrix can be independently restarted.
+  dedicated to GPU work; matrix-voip-agent and Matrix homeserver can be
+  independently restarted.
 
-## Recommended LLM main
+## The three sidecars
 
-> **Qwen3.6-27B AEON Ultimate Uncensored MTP-XS**
-> ([Qwen3.6-27B-AEON-Ultimate-Uncensored-DFlash](https://github.com/AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-DFlash))
->
-> 27B params, NVFP4 hardware-quantized for Blackwell, hybrid Mamba-2 +
-> attention layers, served with DFlash block-diffusion speculative decoding
-> (k=15) for high token throughput on a single Spark. Pairs with this image's
-> v3 base — same vLLM build, no patch divergence.
+| sidecar                                                                                              | image                                                                          | port |
+| ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ---- |
+| LLM main — [Qwen3.6-27B AEON Ultimate MTP-XS](https://github.com/AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-DFlash) | `ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v3`                            | 8000 |
+| ASR — [qwen3-asr-server](https://github.com/AEON-7/qwen3-asr-server)                                 | `ghcr.io/aeon-7/qwen3-asr-server:latest`                                       | 8001 |
+| **TTS** (this repo)                                                                                  | `ghcr.io/aeon-7/qwen3-tts-server:latest`                                       | 8002 |
 
-Bring-up command (compose / docker run, joined to `aeon-stack`):
+Bring up all three, joined to the same `aeon-stack` bridge. Order doesn't
+matter functionally, but bring up the heavy LLM main first if memory is tight.
+
+### LLM main bring-up
 
 ```bash
+docker network create aeon-stack 2>/dev/null || true
+
 docker run -d --name qwen36-aeon-xs \
   --runtime nvidia --network aeon-stack -p 8000:8000 \
   --shm-size=4gb --restart unless-stopped \
@@ -76,110 +84,60 @@ docker run -d --name qwen36-aeon-xs \
     --trust-remote-code
 ```
 
-(See the [`vllm-aeon-ultimate-dflash` image docs](https://github.com/AEON-7/Qwen3.6-NVFP4-DFlash)
-for the full env-var reference and quant-backend tradeoffs.)
+### ASR bring-up
+
+```bash
+docker run -d --name qwen3-asr \
+  --runtime nvidia --network aeon-stack -p 8001:8001 \
+  --shm-size=4gb --restart unless-stopped \
+  -v ${HOME}/.cache/huggingface:/root/.cache/huggingface \
+  -e NVIDIA_VISIBLE_DEVICES=all \
+  ghcr.io/aeon-7/qwen3-asr-server:latest
+```
+
+### TTS bring-up (this image)
+
+```bash
+docker run -d --name qwen3-tts \
+  --runtime nvidia --network aeon-stack -p 8002:8002 \
+  --shm-size=4gb --restart unless-stopped \
+  -v ${HOME}/.cache/huggingface:/root/.cache/huggingface \
+  -e NVIDIA_VISIBLE_DEVICES=all \
+  ghcr.io/aeon-7/qwen3-tts-server:latest
+```
+
+(See [`deploy/deploy-stack.sh`](../deploy/deploy-stack.sh) for an
+interactive one-shot that does TTS + lays out the next-step ASR + LLM
+commands.)
 
 ## Memory budget on Spark (128 GB unified)
 
-| service                                       | vLLM `gpu_mem_util` | resident   |
-| --------------------------------------------- | ------------------- | ---------- |
-| qwen36-aeon-xs (27B NVFP4 + DFlash, BF16 KV)  | 0.75                | ~96 GB     |
-| qwen3-asr (0.6B)                              | 0.06–0.08           | ~5–10 GB   |
-| qwen3-tts (1.7B, bf16, transformers)          | n/a                 | ~4 GB CUDA |
-| host kernel + buffer cache + Docker overhead  | —                   | ~10 GB     |
-| free / margin                                 | —                   | **~10 GB** |
+| service                                       | `gpu-memory-utilization` | resident   |
+| --------------------------------------------- | -----------------------: | ---------: |
+| qwen36-aeon-xs (27B NVFP4 + DFlash, BF16 KV)  |                    0.75  |    ~96 GB  |
+| qwen3-asr (0.6B)                              |              0.06–0.08  |   ~5–10 GB |
+| qwen3-tts (1.7B, transformers, bf16)          |                     n/a |  ~4 GB CUDA |
+| host kernel + buffer cache + Docker overhead  |                       — |    ~10 GB  |
+| free / margin                                 |                       — | **~10 GB** |
 
-That margin is tight; never push `gpu_memory_utilization` past **0.88** on
-unified-memory Spark — see the
-[`gpu-memory-utilization` cap note](https://github.com/AEON-7/Qwen3.6-NVFP4-DFlash#dgx-spark-gpu_memory-utilization-caps-at-088).
+The margin is tight; **never** push `gpu-memory-utilization` past **0.88**
+on unified-memory Spark — see the
+[gpu-memory cap note](https://github.com/AEON-7/Qwen3.6-NVFP4-DFlash#dgx-spark-gpu_memory-utilization-caps-at-088).
 
 ## Latency budget (measured, hot path)
 
-| stage                                       | wall                |
-| ------------------------------------------- | ------------------- |
-| inbound RTP packet → matrix-voip-agent      | ~5 ms (Matrix WebRTC) |
-| ASR (1.92 s clip → text)                    | 120 ms              |
-| LLM (vLLM `chat/completions`, 8 tok answer) | 482 ms              |
-| TTS (text → 1.92 s WAV)                     | 1476 ms             |
-| outbound RTP packet → Matrix client         | ~5 ms                |
-| **End-to-end voice turn**                   | **~2.1 s**          |
-
-## Integration: matrix-voip-agent
-
-The matrix-voip-agent (https://github.com/AEON-7/matrix-voip-agent) is a
-headless WebRTC bridge that auto-answers Matrix VoIP calls and pipes audio
-to/from a configurable AI backend.
-
-To point it at this stack, set the following on the matrix-voip-agent host:
-
-```bash
-# .env on pacific (192.168.1.155)
-
-# disable old paths
-WHISPER_ENABLED=false
-# ELEVENLABS_API_KEY=    # leave unset
-
-# wire to Spark sidecars
-STT_BACKEND=qwen
-ASR_ENDPOINT=http://192.168.1.116:8001/v1/audio/transcriptions
-ASR_MODEL=qwen3-asr
-ASR_LANGUAGE=en
-
-TTS_BACKEND=qwen
-TTS_ENDPOINT=http://192.168.1.116:8002/v1/audio/speech
-TTS_MODEL=qwen3-tts
-TTS_VOICE="A warm, expressive adult voice with natural cadence."
-
-# wire LLM main
-LLM_BASE_URL=http://192.168.1.116:8000/v1
-LLM_MODEL=qwen36-ultimate-xs
-LLM_API_KEY=ignored        # any non-empty string works
-```
-
-Audio formats expected on the wire:
-
-- ASR consumes WAV (any rate; vLLM resamples internally).
-  matrix-voip-agent captures PCM s16le 16 kHz mono from `pw-record` and
-  wraps it in a WAV header in-memory before POSTing.
-- TTS produces WAV (24 kHz mono 16-bit by default) — strip the RIFF header
-  and pipe the raw PCM to `pw-play -r 24000 -f s16 -c 1`.
-
-## Integration: OpenClaw
-
-If your OpenClaw gateway has its own LLM client config (rather than always
-delegating to matrix-voip-agent), point it at the same vLLM main:
-
-```bash
-LLM_BASE_URL=http://192.168.1.116:8000/v1
-LLM_MODEL=qwen36-ultimate-xs
-LLM_API_KEY=ignored
-```
-
-OpenClaw doesn't currently call the ASR/TTS endpoints directly — those are
-voice-pipeline concerns, owned by matrix-voip-agent in the recommended
-topology. The voice loop carries OpenClaw's memory + skills context because
-matrix-voip-agent forwards each turn through OpenClaw before hitting the
-LLM main.
-
-## IP-as-environment-variable convention
-
-Everything LAN-facing should be configurable. Every example above uses a
-literal `192.168.1.116` for clarity, but in production this should be an
-env var your deploy tooling populates per-environment:
-
-```bash
-SPARK_HOST=192.168.1.116
-LLM_BASE_URL=http://${SPARK_HOST}:8000/v1
-ASR_ENDPOINT=http://${SPARK_HOST}:8001/v1/audio/transcriptions
-TTS_ENDPOINT=http://${SPARK_HOST}:8002/v1/audio/speech
-```
-
-The image itself never assumes a host IP — it only listens on `0.0.0.0` and
-joins the named Docker bridge. The IP-substitution lives in the client config
-on pacific (matrix-voip-agent / OpenClaw `.env`).
+| stage                                       | wall      |
+| ------------------------------------------- | --------- |
+| inbound RTP packet → matrix-voip-agent      | ~5 ms     |
+| ASR (1.92 s clip → text)                    | 120 ms    |
+| LLM (vLLM `chat/completions`, ~10 tok)      | ~480 ms   |
+| **TTS** (text → 1.92 s WAV)                 | **~1.48 s** |
+| outbound RTP → Matrix client                | ~5 ms     |
+| **End-to-end voice turn**                   | **~2.1 s** |
 
 ## See also
 
-- [README.md](../README.md) — top-level QuickStart.
-- [docs/MODELS.md](MODELS.md) — supported model variants.
-- [agents.md](../agents.md) — agent-readable bring-up runbook.
+- [docs/MODELS.md](MODELS.md) — supported TTS variants
+- [docs/INTEGRATIONS.md](INTEGRATIONS.md) — wiring guides for Matrix, OpenAI
+  SDK, OpenWebUI, Home Assistant
+- [agents.md](../agents.md) — agent-readable runbook
