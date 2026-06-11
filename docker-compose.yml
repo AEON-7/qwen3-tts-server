@@ -1,5 +1,10 @@
 # OpenAI-compatible TTS sidecar — Qwen3-TTS-12Hz-1.7B-VoiceDesign on GPU
-# bf16 + flash-attn 2 (sm_120 / Spark) → ~1.16x RTF (real-time) on DGX Spark.
+#
+# NOTE: this compose file builds the LEGACY v0.1 image (non-streaming
+# qwen-tts SDK, bf16 + flash-attn 2, VoiceDesign only). The deployed
+# v0.3.0 streaming build (faster-qwen3-tts engine, VoiceDesign +
+# VoiceClone, first audio ~0.4 s, ~1.7x realtime) is documented in
+# README.md → "Deploying the v0.3.0 streaming build".
 #
 # Designed to share a Docker bridge with a vLLM container so the LLM→TTS hop
 # stays on the local bridge (sub-ms loopback). To use:

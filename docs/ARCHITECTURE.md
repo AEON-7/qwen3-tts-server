@@ -15,8 +15,8 @@ over the LAN.
                       │   ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐          │
                       │   │ qwen36-aeon-xs   │  │ qwen3-asr        │  │ qwen3-tts        │          │
                       │   │ vLLM main:8000   │  │ vLLM ASR:8001    │  │ FastAPI TTS:8002 │          │
-                      │   │ Qwen3.6-27B      │  │ Qwen3-ASR-0.6B   │  │ Qwen3-TTS-1.7B   │          │
-                      │   │ NVFP4 + DFlash   │  │ flash-attn 2     │  │ bf16+flash-attn 2│          │
+                      │   │ Qwen3.6-27B      │  │ Qwen3-ASR-0.6B   │  │ Qwen3-TTS-1.7B×2 │          │
+                      │   │ NVFP4 + DFlash   │  │ flash-attn 2     │  │ faster-qwen3-tts │          │
                       │   └──────────┬───────┘  └─────────┬────────┘  └─────────┬────────┘          │
                       │              │                    │                     │                   │
                       │              └────────────────────┼─────────────────────┘                   │
@@ -53,7 +53,7 @@ over the LAN.
 | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ---- |
 | LLM main — [Qwen3.6-27B AEON Ultimate MTP-XS](https://github.com/AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-DFlash) | `ghcr.io/aeon-7/vllm-aeon-ultimate-dflash:qwen36-v3`                            | 8000 |
 | ASR — [qwen3-asr-server](https://github.com/AEON-7/qwen3-asr-server)                                 | `ghcr.io/aeon-7/qwen3-asr-server:latest`                                       | 8001 |
-| **TTS** (this repo)                                                                                  | `ghcr.io/aeon-7/qwen3-tts-server:latest`                                       | 8002 |
+| **TTS** (this repo)                                                                                  | v0.3.0 streaming build — see [README → Deploying](../README.md#deploying-the-v030-streaming-build); legacy v0.1: `ghcr.io/aeon-7/qwen3-tts-server:latest` | 8002 |
 
 Bring up all three, joined to the same `aeon-stack` bridge. Order doesn't
 matter functionally, but bring up the heavy LLM main first if memory is tight.
@@ -116,7 +116,7 @@ commands.)
 | --------------------------------------------- | -----------------------: | ---------: |
 | qwen36-aeon-xs (27B NVFP4 + DFlash, BF16 KV)  |                    0.75  |    ~96 GB  |
 | qwen3-asr (0.6B)                              |              0.06–0.08  |   ~5–10 GB |
-| qwen3-tts (1.7B, transformers, bf16)          |                     n/a |  ~4 GB CUDA |
+| qwen3-tts (v0.3.0: 1.7B VoiceDesign + 1.7B Base, faster-qwen3-tts) |    n/a |  ~4 GB CUDA per model |
 | host kernel + buffer cache + Docker overhead  |                       — |    ~10 GB  |
 | free / margin                                 |                       — | **~10 GB** |
 
@@ -126,14 +126,25 @@ on unified-memory Spark — see the
 
 ## Latency budget (measured, hot path)
 
+With the v0.3.0 **streaming** TTS build (faster-qwen3-tts engine,
+`VOXTRAL_STREAMING=true` on the agent side):
+
 | stage                                       | wall      |
 | ------------------------------------------- | --------- |
 | inbound RTP packet → matrix-voip-agent      | ~5 ms     |
 | ASR (1.92 s clip → text)                    | 120 ms    |
 | LLM (vLLM `chat/completions`, ~10 tok)      | ~480 ms   |
-| **TTS** (text → 1.92 s WAV)                 | **~1.48 s** |
+| **TTS time-to-first-audio (streaming)**     | **~0.4 s** |
 | outbound RTP → Matrix client                | ~5 ms     |
-| **End-to-end voice turn**                   | **~2.1 s** |
+| **Agent starts speaking**                   | **~1.0 s** |
+
+Generation then sustains ~2 s of audio per ~1.16 s of wall time
+(~1.65–1.75× realtime), so playback never underruns.
+
+For reference, the **non-streaming** (full-synthesis) path: TTS for a
+1.92 s clip takes ~1.48 s, putting the end-to-end voice turn at
+**~2.1 s** — and long replies scale linearly (~12.7 s wait for a 22 s
+reply), which is exactly what streaming eliminates.
 
 ## See also
 

@@ -2,6 +2,11 @@
 # deploy-tts.sh — pull the qwen3-tts-server image from ghcr.io and serve a
 # Qwen3-TTS variant of the user's choice on port 8002.
 #
+# NOTE: this deploys the LEGACY v0.1 image (non-streaming, qwen-tts SDK,
+# VoiceDesign only). For the v0.3.0 streaming build (faster-qwen3-tts
+# engine, VoiceDesign + VoiceClone) see README.md →
+# "Deploying the v0.3.0 streaming build".
+#
 # Usage:
 #   bash deploy/deploy-tts.sh                  # interactive picker
 #   QWEN_TTS_MODEL=Qwen/... bash deploy/deploy-tts.sh   # non-interactive

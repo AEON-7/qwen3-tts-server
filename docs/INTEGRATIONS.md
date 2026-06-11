@@ -25,37 +25,44 @@ Matrix client (Element, nheko, FluffyChat, etc.) by dialing a contact.
 
 ### matrix-voip-agent `.env`
 
+These are the env names the agent actually reads — full table in the
+[matrix-voip-agent README](https://github.com/AEON-7/matrix-voip-agent#configuration)
+and [AGENTS.md](https://github.com/AEON-7/matrix-voip-agent/blob/main/AGENTS.md):
+
 ```bash
 # disable the old whisper.cpp + ElevenLabs paths
 WHISPER_ENABLED=false
 # ELEVENLABS_API_KEY=        # leave unset
 
 # pair with qwen3-asr-server for the speech recognition leg
-STT_BACKEND=qwen
-ASR_ENDPOINT=http://${SPARK_HOST}:8001/v1/audio/transcriptions
-ASR_MODEL=qwen3-asr
-ASR_LANGUAGE=en
+OMNI_ASR_ENABLED=true
+OMNI_ASR_BASE_URL=http://${SPARK_HOST}:8001/v1
+OMNI_ASR_MODEL=qwen3-asr
 
 # wire to qwen3-tts-server (this repo)
-TTS_BACKEND=qwen
-TTS_ENDPOINT=http://${SPARK_HOST}:8002/v1/audio/speech
-TTS_MODEL=qwen3-tts
-TTS_VOICE="A warm, expressive adult voice with natural cadence."
-
-# wire LLM main
-LLM_BASE_URL=http://${SPARK_HOST}:8000/v1
-LLM_MODEL=qwen36-ultimate-xs
-LLM_API_KEY=ignored          # any non-empty string works
+VOXTRAL_ENABLED=true
+VOXTRAL_BASE_URL=http://${SPARK_HOST}:8002/v1
+VOXTRAL_MODEL=qwen3-tts              # qwen3-tts-clone for clone mode
+VOXTRAL_VOICE_DESCRIPTION="A warm, expressive adult voice with natural cadence."
+VOXTRAL_STREAMING=true               # recommended: first audio ~0.4 s
+VOXTRAL_API_KEY=<YOUR_API_KEY>
 ```
 
 ### Audio format on the wire
 
-- This server returns **WAV (24 kHz mono 16-bit PCM by default)**.
-  matrix-voip-agent strips the RIFF header (`data` chunk offset) and pipes
-  the raw PCM to `pw-play -r 24000 -f s16 -c 1`.
+- **Streaming (recommended, v0.3.0):** `stream: true` +
+  `response_format: "pcm"` yields raw **s16le mono 24 kHz** chunks as
+  they are generated (chunked transfer-encoding; read the
+  `x-audio-sample-rate` response header rather than hardcoding 24 kHz).
+  matrix-voip-agent does exactly this when `VOXTRAL_STREAMING=true` and
+  pipes the chunks straight into PipeWire — first audio ~0.4 s.
+- **Non-streaming:** the server returns **WAV (24 kHz mono 16-bit PCM by
+  default)**. matrix-voip-agent strips the RIFF header (`data` chunk
+  offset) and pipes the raw PCM to `pw-play -r 24000 -f s16 -c 1`.
 - If you're rolling your own bridge, that's the contract: POST JSON with
-  `input` text, get back WAV bytes. Read the sample rate from the WAV
-  header (offset 24, little-endian uint32) — don't hardcode 24 kHz on the
+  `input` text, get back audio bytes (or a chunked stream). Read the
+  sample rate from the `x-audio-sample-rate` header or the WAV header
+  (offset 24, little-endian uint32) — don't hardcode 24 kHz on the
   client side, future model variants may differ.
 
 ---
@@ -70,7 +77,7 @@ and point `base_url` at it:
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url=f"http://{SPARK_HOST}:8002/v1", api_key="ignored")
+client = OpenAI(base_url=f"http://{SPARK_HOST}:8002/v1", api_key="<YOUR_API_KEY>")
 
 resp = client.audio.speech.create(
     model="qwen3-tts",
@@ -88,7 +95,7 @@ import OpenAI from "openai";
 
 const client = new OpenAI({
   baseURL: `http://${SPARK_HOST}:8002/v1`,
-  apiKey: "ignored",
+  apiKey: "<YOUR_API_KEY>",
 });
 
 const resp = await client.audio.speech.create({
@@ -110,14 +117,15 @@ OpenWebUI's Audio settings expect an OpenAI-compatible TTS endpoint:
 ```
 Settings → Audio → Text-to-Speech Engine: OpenAI
   TTS API Base URL: http://${SPARK_HOST}:8002/v1
-  TTS API Key:      ignored
+  TTS API Key:      <YOUR_API_KEY>
   TTS Model:        qwen3-tts
   TTS Voice:        A warm, expressive adult voice.
 ```
 
 The "voice" field is sent as the OpenAI `voice` param, which this server
-forwards to qwen-tts as the `instruct` description — so any natural-language
-voice description works.
+treats as the VoiceDesign description — so any natural-language voice
+description works. (Set TTS Model to `qwen3-tts-clone` and Voice to a
+cloned-voice id from `GET /v1/audio/voices` for clone mode.)
 
 ---
 
@@ -160,18 +168,28 @@ curl -sf -X POST http://${SPARK_HOST}:8002/v1/audio/speech \
   --output speech.wav
 ```
 
-Request body fields:
+Request body fields (v0.3.0 — full reference with sampling knobs and
+aliases in the [README API reference](../README.md#api-reference-v030-from-the-live-openapi)):
 
 | field             | required | notes                                                      |
 | ----------------- | :------: | ---------------------------------------------------------- |
 | `input`           |    ✓     | Text to synthesize.                                        |
-| `model`           |          | Defaults to `qwen3-tts` (the served-model-name).           |
-| `voice`           |          | Free-form voice description. Defaults to `QWEN_TTS_DEFAULT_VOICE`. |
-| `response_format` |          | `wav` (default), `flac`, or `mp3`.                         |
-| `language`        |          | One of `zh`, `en`, `ja`, `ko`, `de`, `fr`, `ru`, `pt`, `es`, `it`. Auto-detect if omitted. |
+| `model`           |          | `qwen3-tts` (default, VoiceDesign) or `qwen3-tts-clone` (voice clone). |
+| `mode`            |          | `voice_design` \| `voice_clone` — alternative to picking via `model`. |
+| `voice`           |          | Free-form voice description, or a cloned-voice id from `GET /v1/audio/voices` (clone mode). |
+| `instructions`    |          | VoiceDesign instruction text (aliases `instruct`, `prompt`). |
+| `ref_audio` / `ref_text` |   | Clone reference sample + transcript.                       |
+| `response_format` |          | `wav` (default), `flac`, `mp3`, or `pcm` (raw s16le — recommended for streaming). |
+| `stream`          |          | `true` to stream chunks as they are generated.             |
+| `chunk_size`      |          | Streaming codec frames per audio chunk.                    |
+| `language`        |          | Full language name: `English`, `Chinese`, `Auto`, ... Auto-detect if omitted. |
+| `speed`           |          | Accepted for OpenAI compatibility; **currently ignored**.  |
+| sampling knobs    |          | `max_new_tokens` (1–8192, def 2048), `min_new_tokens`, `temperature` (def 0.9), `top_k` (def 50), `top_p` (def 1.0), `repetition_penalty` (def 1.05). |
 
-The endpoint accepts any `Authorization` header (no real auth — put a proxy
-in front for any non-trusted network).
+Auth: clients send `Authorization: Bearer <YOUR_API_KEY>` — the key is
+operator-configured on the deployment, and enforcement depends on it.
+Put an auth proxy in front for any non-trusted network; never expose
+port 8002 publicly.
 
 ---
 
@@ -186,8 +204,16 @@ engine. If your framework's TTS abstraction lets you set a custom
 
 ## A note on running this image elsewhere
 
-Nothing in the image is Spark-specific *except* the flash-attn 2 wheel,
-which is built for `sm_120`. On other Blackwell / consumer / datacenter
-GPUs the image will boot — flash-attn auto-falls back to SDPA at runtime
-if the kernel can't load. Re-build with the right `FLASH_ATTN_CUDA_ARCHS`
-if you want native flash-attn there too.
+This applies to the **legacy v0.1 image** in this repo
+(`ghcr.io/aeon-7/qwen3-tts-server:latest`): nothing in it is
+Spark-specific *except* the flash-attn 2 wheel, which is built for
+`sm_120`. On other Blackwell / consumer / datacenter GPUs the image will
+boot — flash-attn auto-falls back to SDPA at runtime if the kernel can't
+load. Re-build with the right `FLASH_ATTN_CUDA_ARCHS` if you want native
+flash-attn there too.
+
+The **v0.3.0 streaming build** runs on the
+[faster-qwen3-tts](https://github.com/andimarafioti/faster-qwen3-tts)
+CUDA-graph engine instead; for portability of that path see the engine
+repo and the DGX Spark packaging at
+[mARTin-B78/dgx-spark-faster-qwen3-tts](https://github.com/mARTin-B78/dgx-spark-faster-qwen3-tts).

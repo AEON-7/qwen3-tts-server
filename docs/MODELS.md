@@ -1,9 +1,20 @@
 # Supported TTS Models
 
-The deploy script (`deploy/deploy-tts.sh`) accepts any of the variants below.
-Pick interactively or set the `QWEN_TTS_MODEL` env var to skip the prompt.
+> **v0.3.0 (deployed streaming build):** runs **two** variants
+> simultaneously on the
+> [faster-qwen3-tts](https://github.com/andimarafioti/faster-qwen3-tts)
+> engine — `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` (served as
+> `qwen3-tts`) and `Qwen/Qwen3-TTS-12Hz-1.7B-Base` (served as
+> `qwen3-tts-clone`). No redeploy is needed to switch between voice
+> design and voice cloning — pick per request via `model` or `mode`.
+> The variant-switching workflow below (`QWEN_TTS_MODEL` +
+> `deploy/deploy-tts.sh`) applies to the **legacy v0.1 build** only.
 
-The image is **officially validated** with:
+The legacy deploy script (`deploy/deploy-tts.sh`) accepts any of the
+variants below. Pick interactively or set the `QWEN_TTS_MODEL` env var
+to skip the prompt.
+
+The legacy v0.1 image is **officially validated** with:
 
 - **`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`** — the deploy-script default
 
@@ -30,6 +41,7 @@ it unless using a custom fork.
   Best for "an elderly French man with a smoker's voice" / character-driven apps.
 - **Want to *clone* an existing voice from a 3-sec sample?** → **Base** (1.7B
   for quality, 0.6B for speed). Best for personalization / branded voice.
+  On v0.3.0 this is already loaded — just use `model: qwen3-tts-clone`.
 - **Want a fixed catalog of speakers + style instructions?** → **CustomVoice 1.7B**.
   Best when you need consistent voices across sessions.
 - **Want the cheapest fixed-speaker option?** → **CustomVoice 0.6B**.
@@ -51,17 +63,23 @@ other GPUs.
 ## Audio output format
 
 Default WAV output: **24 kHz mono 16-bit PCM**. The exact sample rate
-comes from the model — don't hardcode 24 kHz on the client side; read the
-RIFF header and respect what arrives.
+comes from the model — don't hardcode 24 kHz on the client side; read
+the `x-audio-sample-rate` response header (v0.3.0) or the RIFF header
+and respect what arrives.
 
-The server also supports `flac` (lossless, smaller) and `mp3` (needs system
-`libmp3lame`, which the image ships).
+The server also supports `flac` (lossless, smaller), `mp3` (needs system
+`libmp3lame`, which the image ships), and on v0.3.0 `pcm` (raw s16le —
+the recommended format for streaming).
 
 ## Languages supported
 
 All variants support: `auto`, `chinese`, `english`, `french`, `german`,
 `italian`, `japanese`, `korean`, `portuguese`, `russian`, `spanish`.
 
-The OpenAI body field is short codes (`zh`, `en`, `ja`, ...) which the
-server maps via the underlying SDK. Pass `language=null` (or omit the
-field) to let the model auto-detect from the input text.
+- **v0.3.0:** the `language` field takes **full names** — `English`,
+  `Chinese`, `Auto`, ...
+- **Legacy v0.1:** the field is short codes (`zh`, `en`, `ja`, ...)
+  mapped via the qwen-tts SDK.
+
+Pass `language=null` (or omit the field) to let the model auto-detect
+from the input text.

@@ -3,6 +3,18 @@
 Instructions for an AI agent to bring this TTS sidecar up cleanly on a
 fresh host. Self-contained: you don't need to also read README.md.
 
+> **Version note:** this runbook brings up the **legacy v0.1 image**
+> contained in this repo (non-streaming, qwen-tts SDK, VoiceDesign
+> only). The author's deployed **v0.3.0 streaming build**
+> (faster-qwen3-tts engine, VoiceDesign + VoiceClone, `stream: true`,
+> `GET /v1/audio/voices`) is documented in
+> [README.md](README.md#deploying-the-v030-streaming-build); its source
+> publish here is pending. To tell which build you're talking to:
+> `curl /health` — v0.3.0 reports `"backend": "faster-qwen3-tts"` plus
+> `clone_loaded` / `voice_library` / `sample_rate`; v0.1 reports only
+> `{"status":"ok","model_loaded":true}`. The `model_loaded` health grep
+> below works for both.
+
 ## Preconditions
 
 1. **Host kind**: Image is built for `aarch64` + `sm_120` (NVIDIA DGX Spark
@@ -88,10 +100,11 @@ bash deploy/deploy-tts.sh`).
 
 **`flash-attn install failed; will fall back to sdpa at runtime`** (build-time)
 
-This is non-fatal. The image still boots; TTS will use SDPA attention
-instead. RTF drops from ~1.30× to ~0.7×, still usable. To get flash-attn
-back: rebuild from this repo's Dockerfile with the right
-`FLASH_ATTN_CUDA_ARCHS` for your GPU.
+This is non-fatal (legacy v0.1 image only — the v0.3.0 build uses the
+faster-qwen3-tts engine, not flash-attn). The image still boots; TTS
+will use SDPA attention instead. RTF drops from ~1.30× to ~0.7×, still
+usable. To get flash-attn back: rebuild from this repo's Dockerfile with
+the right `FLASH_ATTN_CUDA_ARCHS` for your GPU.
 
 ## Smoke test
 
@@ -129,7 +142,7 @@ Run the docker commands in
 [docs/ARCHITECTURE.md → "The three sidecars"](docs/ARCHITECTURE.md#the-three-sidecars).
 Order matters only if memory is tight (bring up the heavy LLM first).
 
-### Switch model variants live
+### Switch model variants live (legacy v0.1 image)
 
 ```bash
 docker rm -f qwen3-tts
@@ -137,7 +150,9 @@ QWEN_TTS_MODEL=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice bash deploy/deploy-tts.sh
 ```
 
 The HF cache is bind-mounted, so a previously-downloaded variant restarts
-instantly.
+instantly. (On the v0.3.0 streaming build no switch is needed for voice
+cloning — VoiceDesign and Base are both loaded; select per request with
+`model: qwen3-tts` / `model: qwen3-tts-clone`.)
 
 ## Tear-down
 
@@ -150,7 +165,9 @@ docker network rm aeon-stack 2>/dev/null || true
 ## Don'ts
 
 - Don't bind `8002` to a public interface without putting an auth proxy in
-  front. The endpoint accepts any `Authorization` header (no real auth).
+  front. Clients send `Authorization: Bearer <YOUR_API_KEY>` by
+  convention, but the key is operator-configured and enforcement depends
+  on the deployment — treat the port as unauthenticated unless verified.
 - Don't `pip install vllm[audio]` into a derivative image — the meta-package
   re-resolves and downgrades vLLM core deps which silently regresses TTS
   hot inference latency by ~5×. The Dockerfile installs only `av --no-deps`;
