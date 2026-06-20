@@ -122,7 +122,7 @@ commands.)
 
 The margin is tight; **never** push `gpu-memory-utilization` past **0.88**
 on unified-memory Spark — see the
-[gpu-memory cap note](https://github.com/AEON-7/Qwen3.6-NVFP4-DFlash#dgx-spark-gpu_memory-utilization-caps-at-088).
+[gpu-memory cap note](https://github.com/AEON-7/Qwen3.6-35B-A3B-heretic-NVFP4-DFlash#dgx-spark-gpu_memory-utilization-caps-at-088).
 
 ## Latency budget (measured, hot path)
 
